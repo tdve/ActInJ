@@ -5,17 +5,21 @@ import com.actinj.supervision.Strategy;
 import com.actinj.supervision.Supervisor;
 import com.actinj.supervision.SupervisorFlags;
 import com.actinj.supervision.Restart;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.util.Arrays;
 
 public class Main {
+    private static final Logger logger = LoggerFactory.getLogger(Main.class);
+
     public static void main(String[] args) throws InterruptedException {
         final Runnable runnable = () -> {
             try {
                 int counter = 0;
                 while (true) {
-                    System.out.println(++counter);
+                    logger.info("Tick {}", ++counter);
                     Thread.sleep(Duration.ofSeconds(1));
                 }
             } catch (InterruptedException e) {

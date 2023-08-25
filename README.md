@@ -25,5 +25,14 @@ The supervisor in this repo has several goals:
 
 No documentation yet on how to use this thing. It's very early days and the API will certainly still change.
 
+### Supervisor Caveats
+There are of course some important differences between Virtual Threads in Java and Erlang. Erlang threads don't share
+memory (and are therefore called processes, not threads). A crash in one Erlang process, can not affect the state of another.
+Moreover, Erlang's gen_server makes state modifications atomic. If a process crashes while changing the state, you still
+have the full state from before the change, which you can use to restart the thread with. Therefore, restarting Erlang
+processes makes sense to attempt keeping a system up. Restarting a Java thread only makes sense if it is written in such
+a way that the crashing thread did not leave behind inconsistent data for the new thread to use, or for other parts of
+the application.
+
 ## License
 *ActInJ* is published under the [BSD 3-Clause License](LICENSE "BSD 3-Clause License")
