@@ -5,9 +5,7 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.time.Instant;
-import java.util.Collections;
-import java.util.List;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -48,7 +46,7 @@ public class Supervisor implements Supplier<ChildSpec>, Runnable {
 
     @Override
     public ChildSpec get() {
-        return new ChildSpec(id, this, Restart.PERMANENT);
+        return new ChildSpec(id, this, Restart.PERMANENT, Duration.ofSeconds(30));
     }
 
     private ThreadConfig startThread(final ChildSpec childSpec) {
@@ -94,16 +92,9 @@ public class Supervisor implements Supplier<ChildSpec>, Runnable {
                 PendingAction action = pendingActions.poll();
                 while (null != action) {
                     if (action.type() == ActionType.RESTART) {
-                        // TODO: only restart once the previous run stopped. To give it time to release resources like
-                        // listening sockets that can prevent the new thread form starting correctly
                         final ChildSpec childSpec = action.childSpec();
-                        children = children.stream().map(threadConfig -> {
-                            if (childSpec.id().equals(threadConfig.spec().id())) {
-                                return startThread(childSpec);
-                            } else {
-                                return threadConfig;
-                            }
-                        }).toList();
+                        children = children.stream().map(threadConfig -> childSpec.id().equals(threadConfig.spec().id())
+                                ? startThread(childSpec) : threadConfig).toList();
                     }
                     action = pendingActions.poll();
                 }
@@ -122,15 +113,7 @@ public class Supervisor implements Supplier<ChildSpec>, Runnable {
             }
         } finally {
             // Stop all child threads should they still be running
-            for (final ThreadConfig child : children) {
-                final Thread childThread = child.thread();
-                if (null != childThread) {
-                    // An interrupt does not seem ideal. Preferably, we would really want to kill this. But that does
-                    // not seem to be possible
-                    childThread.interrupt();
-                }
-            }
-
+            interruptAndWaitToFinish(children);
         }
     }
 
@@ -191,24 +174,64 @@ public class Supervisor implements Supplier<ChildSpec>, Runnable {
         switch (flags.strategy()) {
         case ONE_FOR_ONE -> pendingActions.add(new PendingAction(ActionType.RESTART, childSpec));
         case ONE_FOR_ALL -> {
-            children.forEach(threadConfig -> {
-                threadConfig.thread().interrupt();
-                pendingActions.add(new PendingAction(ActionType.RESTART, threadConfig.spec()));
-            });
+            children.forEach(
+                    threadConfig -> pendingActions.add(new PendingAction(ActionType.RESTART, threadConfig.spec())));
+            interruptAndWaitToFinish(children);
             throw new StopChildrenCheckLoop();
         }
         case REST_FOR_ONE -> {
             final AtomicBoolean seen = new AtomicBoolean(false);
-            children.stream().filter(threadConfig -> {
+            final List<ThreadConfig> toStop = children.stream().filter(threadConfig -> {
                 seen.compareAndSet(false, threadConfig.spec().id().equals(childSpec.id()));
                 return seen.get();
-            }).forEach(threadConfig -> {
-                threadConfig.thread().interrupt();
-                pendingActions.add(new PendingAction(ActionType.RESTART, threadConfig.spec()));
-            });
+            }).toList();
+            toStop.forEach(
+                    threadConfig -> pendingActions.add(new PendingAction(ActionType.RESTART, threadConfig.spec())));
+            interruptAndWaitToFinish(toStop);
             throw new StopChildrenCheckLoop();
         }
         }
+    }
+
+    private void interruptAndWaitToFinish(List<ThreadConfig> threadConfigs) {
+        threadConfigs.stream().map(ThreadConfig::thread).filter(Objects::nonNull).forEach(Thread::interrupt);
+        final Instant timeoutStart = Instant.now();
+        // We nicely ask the threads to stop, by sending them an interrupt. Now we'll give them some time to comply, so
+        // they can clean up their resources, before we restart them. Ideally, if they don't stop within
+        // ChildSpec::shutdown, we would kill them. But there is no API to do this for Virtual Threads...
+        boolean wasInterrupted = false;
+        do {
+            threadConfigs = threadConfigs.stream().filter(tc -> null != tc.thread()).filter(tc -> tc.thread().isAlive())
+                    .filter(tc -> {
+                        Instant expire = timeoutStart.plus(tc.spec().shutdown());
+                        if (expire.isBefore(Instant.now())) {
+                            logger.warn("Thread {} did not end within configured time limit of {}", tc.spec().id(),
+                                    tc.spec().shutdown());
+                            return false;
+                        }
+                        return true;
+                    }).toList();
+            // We'll wait for a random thread, and then again filter out all stopped ones
+            Optional<ThreadConfig> toWaitFor = threadConfigs.stream().findAny();
+            if (toWaitFor.isPresent()) {
+                long expire = timeoutStart.plus(toWaitFor.get().spec().shutdown()).toEpochMilli();
+                long toWait = expire - System.currentTimeMillis();
+                if (toWait > 0) {
+                    try {
+                        toWaitFor.get().thread().join(toWait);
+                    } catch (InterruptedException e) {
+                        // We'll ignore this interrupt for now. If this Supervisor will end up getting restarted, it is
+                        // important that we give all child threads the time to clean up their resources. Otherwise, the
+                        // new threads after the restart, might fail because the old thread is still holding on to
+                        // resources
+                        logger.info("Ignoring interrupt while waiting for children to stop");
+                        wasInterrupted = true;
+                    }
+                }
+            }
+        } while (!threadConfigs.isEmpty());
+        if (wasInterrupted) // Now we are done waiting for children, and we can set the interrupt status back
+            Thread.currentThread().interrupt();
     }
 
     private class StopChildrenCheckLoop extends Exception {

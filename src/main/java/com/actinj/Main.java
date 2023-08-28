@@ -28,12 +28,25 @@ public class Main {
     };
     final static Runnable crashingRunnable = () -> {
         try {
+            int counter = 0;
             while (true) {
+                logger.info("Tick {}", ++counter);
                 Thread.sleep(Duration.ofSeconds(1));
                 throw new RuntimeException("I'm done with this");
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+    };
+    final static Runnable unstoppableRunnable = () -> {
+        int counter = 0;
+        while (true) {
+            logger.info("Tick {}", ++counter);
+            try {
+                Thread.sleep(Duration.ofSeconds(1));
+            } catch (InterruptedException e) {
+                // Ignore
+            }
         }
     };
 
@@ -48,13 +61,15 @@ public class Main {
     private static Supervisor getSupervisor() {
         final AtomicInteger threadCounter = new AtomicInteger(0);
         final Supplier<ChildSpec> childSupplier = () -> new ChildSpec("Child_" + threadCounter.incrementAndGet(),
-                runnable, Restart.TRANSIENT);
+                runnable, Restart.TRANSIENT, Duration.ofSeconds(5));
         final Supplier<ChildSpec> crashSupplier = () -> new ChildSpec("Child_" + threadCounter.incrementAndGet(),
-                crashingRunnable, Restart.TRANSIENT);
+                crashingRunnable, Restart.TRANSIENT, Duration.ofSeconds(5));
+        final Supplier<ChildSpec> unstoppableSupplier = () -> new ChildSpec("Child_" + threadCounter.incrementAndGet(),
+                unstoppableRunnable, Restart.TRANSIENT, Duration.ofSeconds(5));
 
         final Supervisor supervisor2 = new Supervisor("sup2",
-                new SupervisorFlags(Strategy.ONE_FOR_ONE, 5, Duration.ofSeconds(10)),
-                Arrays.asList(childSupplier, crashSupplier, childSupplier));
+                new SupervisorFlags(Strategy.REST_FOR_ONE, 5, Duration.ofSeconds(10)),
+                Arrays.asList(unstoppableSupplier, childSupplier, crashSupplier, childSupplier));
         final Supervisor supervisor = new Supervisor("sup1",
                 new SupervisorFlags(Strategy.ONE_FOR_ONE, 5, Duration.ofSeconds(10)),
                 Arrays.asList(childSupplier, childSupplier, childSupplier, supervisor2));

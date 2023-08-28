@@ -1,4 +1,6 @@
 package com.actinj.supervision;
 
-public record ChildSpec(String id, Runnable start, Restart restart) {
+import java.time.temporal.TemporalAmount;
+
+public record ChildSpec(String id, Runnable start, Restart restart, TemporalAmount shutdown) {
 }
