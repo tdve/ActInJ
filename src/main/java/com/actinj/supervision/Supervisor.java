@@ -19,8 +19,11 @@ public class Supervisor implements Supplier<ChildSpec>, Runnable {
     private record ThreadConfig(Thread thread, ChildSpec spec, AtomicReference<Throwable> failure) {
     }
 
+    public record childCount(int specs, int active, int supervisors, int workers) {
+    }
+
     private enum ActionType {
-        RESTART
+        RESTART, ADD, DELETE
     }
 
     private record PendingAction(ActionType type, ChildSpec childSpec) {
@@ -29,7 +32,7 @@ public class Supervisor implements Supplier<ChildSpec>, Runnable {
     private final String id;
     private final SupervisorFlags flags;
     private List<ThreadConfig> children = Collections.emptyList();
-    private Set<String> childNames = ConcurrentHashMap.newKeySet();
+    private final Set<String> childNames = ConcurrentHashMap.newKeySet();
     private List<ChildSpec> savedState;
     private final AtomicBoolean keepRunning = new AtomicBoolean(true);
     private final ConcurrentLinkedQueue<PendingAction> pendingActions = new ConcurrentLinkedQueue<>();
@@ -40,6 +43,57 @@ public class Supervisor implements Supplier<ChildSpec>, Runnable {
         this.savedState = children.stream().map(Supplier::get).toList();
     }
 
+    public childCount countChildren() {
+        final List<ChildSpec> specs = savedState;
+        // This can never be longer than specs.size(), so it should fit in an int
+        final int supervisors = (int) specs.stream().map(ChildSpec::start).filter(Supervisor.class::isInstance).count();
+        final int active = (int) children.stream().map(ThreadConfig::thread).filter(Objects::nonNull)
+                .filter(Thread::isAlive).count();
+        return new childCount(specs.size(), active, supervisors, specs.size() - supervisors);
+    }
+
+    public boolean deleteChild(final String id) {
+        final Optional<ThreadConfig> threadConfig = children.stream()
+                .filter(conf -> conf.spec().id().equals(id) && (null == conf.thread() || !conf.thread().isAlive()))
+                .findAny();
+        if (threadConfig.isEmpty())
+            return false;
+        pendingActions.add(new PendingAction(ActionType.DELETE, threadConfig.get().spec()));
+        return true;
+    }
+
+    public Optional<ChildSpec> getChildspec(final String id) {
+        return savedState.stream().filter(spec -> spec.id().equals(id)).findAny();
+    }
+
+    public boolean restartChild(final String id) {
+        final Optional<ThreadConfig> threadConfig = children.stream()
+                .filter(conf -> conf.spec().id().equals(id) && null != conf.thread() && !conf.thread().isAlive())
+                .findAny();
+        if (threadConfig.isEmpty())
+            return false; // Not found or still running
+        pendingActions.add(new PendingAction(ActionType.RESTART, threadConfig.get().spec));
+        return true;
+    }
+
+    public boolean startChild(final ChildSpec childSpec) {
+        if (childNames.add(childSpec.id())) {
+            pendingActions.add(new PendingAction(ActionType.ADD, childSpec));
+            return true;
+        }
+        return false;
+    }
+
+    public boolean terminateChild(final String id) {
+        final Optional<ThreadConfig> threadConfig = children.stream()
+                .filter(conf -> conf.spec().id().equals(id) && null != conf.thread() && conf.thread().isAlive())
+                .findAny();
+        if (threadConfig.isEmpty())
+            return false;
+        threadConfig.get().thread().interrupt();
+        return true;
+    }
+
     public void stop() {
         keepRunning.set(false);
     }
@@ -47,6 +101,44 @@ public class Supervisor implements Supplier<ChildSpec>, Runnable {
     @Override
     public ChildSpec get() {
         return new ChildSpec(id, this, Restart.PERMANENT, Duration.ofSeconds(30));
+    }
+
+    @Override
+    public void run() {
+        // There might be a parent supervisor who restarted us, so set keepRunning (back) to true
+        keepRunning.set(true);
+        AtomicReference<List<Instant>> restarts = new AtomicReference<>(Collections.emptyList());
+        try {
+            // We just started. We might be recovering from a crash
+            childNames.clear();
+            children = savedState.stream().filter(childSpec -> childNames.add(childSpec.id())).map(this::startThread)
+                    .toList();
+            while (keepRunning.get()) {
+                // Now, we want to run the pending actions
+                PendingAction action = pendingActions.poll();
+                while (null != action) {
+                    children = processAction(action.type(), action.childSpec());
+                    action = pendingActions.poll();
+                }
+                // We made it this far. Let's update the state, so we have it to recover from in case a restart happens
+                savedState = children.stream().map(ThreadConfig::spec).toList();
+                try {
+                    synchronized (this) {
+                        // 3s for testing. We'd want this to be faster later
+                        wait(Duration.ofSeconds(3).toMillis());
+                    }
+                    logger.debug("Supervisor {} checking children", id);
+                    checkChildren(restarts);
+                } catch (InterruptedException e) {
+                    logger.debug("Supervisor {} stopped by InterruptedException", id);
+                    Thread.currentThread().interrupt();
+                    return; // We need to stop
+                }
+            }
+        } finally {
+            // Stop all child threads should they still be running
+            interruptAndWaitToFinish(children);
+        }
     }
 
     private ThreadConfig startThread(final ChildSpec childSpec) {
@@ -74,47 +166,33 @@ public class Supervisor implements Supplier<ChildSpec>, Runnable {
         return new ThreadConfig(thread, childSpec, causeOfFailure);
     }
 
-    @Override
-    public void run() {
-        // There might be a parent supervisor who restarted us, so set keepRunning (back) to true
-        keepRunning.set(true);
-        AtomicReference<List<Instant>> restarts = new AtomicReference<>(Collections.emptyList());
-        try {
-            // We just started. We might be recovering from a crash
-            childNames.clear();
-            children = savedState.stream().filter(childSpec -> childNames.add(childSpec.id())).map(this::startThread)
+    private List<ThreadConfig> processAction(final ActionType type, final ChildSpec childSpec) {
+        switch (type) {
+        case RESTART -> {
+            return children.stream()
+                    .map(threadConfig -> childSpec.id().equals(threadConfig.spec().id())
+                            && (null == threadConfig.thread() || !threadConfig.thread().isAlive())
+                                    ? startThread(childSpec) : threadConfig)
                     .toList();
-            while (keepRunning.get()) {
-                // The first thing we do in any loop, is to save the previous state, should we need to
-                // recover from it after a crash in the future
-                savedState = children.stream().map(ThreadConfig::spec).toList();
-                // Now, we want to run the pending actions
-                PendingAction action = pendingActions.poll();
-                while (null != action) {
-                    if (action.type() == ActionType.RESTART) {
-                        final ChildSpec childSpec = action.childSpec();
-                        children = children.stream().map(threadConfig -> childSpec.id().equals(threadConfig.spec().id())
-                                ? startThread(childSpec) : threadConfig).toList();
-                    }
-                    action = pendingActions.poll();
-                }
-                try {
-                    synchronized (this) {
-                        // 3s for testing. We'd want this to be faster later
-                        wait(Duration.ofSeconds(3).toMillis());
-                    }
-                    logger.debug("Supervisor {} checking children", id);
-                    checkChildren(restarts);
-                } catch (InterruptedException e) {
-                    logger.debug("Supervisor {} stopped by InterruptedException", id);
-                    Thread.currentThread().interrupt();
-                    return; // We need to stop
-                }
-            }
-        } finally {
-            // Stop all child threads should they still be running
-            interruptAndWaitToFinish(children);
         }
+        case ADD -> {
+            if (children.stream().noneMatch(tc -> tc.spec().id().equals(childSpec.id()))) {
+                childNames.add(childSpec.id()); // Make sure it's listed
+                return Stream.concat(children.stream(), Stream.of(startThread(childSpec))).toList();
+            }
+            return children; // We do nothing
+        }
+        case DELETE -> {
+            final List<ThreadConfig> result = children.stream()
+                    .filter(threadConfig -> !childSpec.id().equals(threadConfig.spec().id())
+                            || (null != threadConfig.thread() && threadConfig.thread().isAlive()))
+                    .toList();
+            if (result.stream().noneMatch(tc -> tc.spec().id().equals(childSpec.id())))
+                childNames.remove(childSpec.id());
+            return result;
+        }
+        }
+        return children;
     }
 
     private void checkChildren(AtomicReference<List<Instant>> restarts) {
@@ -194,6 +272,7 @@ public class Supervisor implements Supplier<ChildSpec>, Runnable {
     }
 
     private void interruptAndWaitToFinish(List<ThreadConfig> threadConfigs) {
+        // TODO: we should not do this in parallel. We should stop them one by one, and give them time to finish
         threadConfigs.stream().map(ThreadConfig::thread).filter(Objects::nonNull).forEach(Thread::interrupt);
         final Instant timeoutStart = Instant.now();
         // We nicely ask the threads to stop, by sending them an interrupt. Now we'll give them some time to comply, so
